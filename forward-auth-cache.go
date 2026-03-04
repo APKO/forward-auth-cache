@@ -178,7 +178,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	if item := a.cache.Get(key); item != nil {
 		entry := item.Value()
 		if a.Debug {
-			a.logger.Info("cache hit", zap.String("key", key), zap.Duration("latency", time.Since(start)))
+			a.logger.Info("cache hit", zap.String("key", key), zap.Object("entry", entry), zap.Duration("latency", time.Since(start)))
 		}
 		for hname, hval := range entry.Headers {
 			r.Header.Set(hname, hval)
