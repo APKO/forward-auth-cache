@@ -113,18 +113,14 @@ func (a *ForwardAuthCache) Cleanup() error {
 func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
-	// ─── Швидке отримання токена ───────────────────────────────────────
 	token := ""
 	if c, _ := r.Cookie(a.CookieName); c != nil {
 		token = c.Value
 	}
-
 	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 	if clientIP == "" {
 		clientIP = r.RemoteAddr
 	}
-
-	// ─── Швидкий шлях для типового ключа ───────────────────────────────
 	var key string
 	if a.CacheKeyTemplate == "auth:{cookie.__Secure_auth_token}:ip:{remote_host}" {
 		key = "auth:" + token + ":ip:" + clientIP
@@ -132,19 +128,17 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		key = repl.ReplaceAll(a.CacheKeyTemplate, "")
 	}
 
-	// ─── Кеш хіт ───────────────────────────────────────────────────────
 	if item := a.cache.Get(key); item != nil {
 		entry := item.Value()
 
-		if entry.Status < 200 || entry.Status > 299 {
-			// Помилка авторизації — віддаємо тільки заголовки та статус
+		if entry.Status != http.StatusOK && entry.Status != http.StatusNoContent {
 			h := w.Header()
 			maps.Copy(h, entry.Headers)
 			w.WriteHeader(entry.Status)
-			return nil // тіло не відправляємо
+			// Тут тіла немає, бо ми його не кешуємо
+			return nil
 		}
 
-		// Успішно — копіюємо потрібні заголовки
 		for _, hname := range a.CopyHeaders {
 			if v := entry.Headers.Get(hname); v != "" {
 				r.Header.Set(hname, v)
@@ -153,12 +147,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		return next.ServeHTTP(w, r)
 	}
 
-	// ─── Кеш промах ────────────────────────────────────────────────────
-	u, err := url.Parse(a.AuthURL)
-	if err != nil {
-		return caddyhttp.Error(http.StatusInternalServerError, err)
-	}
-
+	u, _ := url.Parse(a.AuthURL)
 	reqURL := a.AuthURL
 	reqHost := u.Host
 	if u.Scheme == "h2c" {
@@ -183,27 +172,29 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	}
 	defer resp.Body.Close()
 
-	// Читаємо тіло, щоб з'єднання коректно закрилося, але не зберігаємо
-	io.Copy(io.Discard, resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return caddyhttp.Error(http.StatusBadGateway, err)
+	}
 
 	entry := cacheEntry{
 		Status:  resp.StatusCode,
 		Headers: resp.Header.Clone(),
 	}
 
-	// Кешуємо тільки успішні та клієнтські помилки (не 5xx)
-	if resp.StatusCode < 500 {
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
 		a.cache.Set(key, entry, ttlcache.DefaultTTL)
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		h := w.Header()
-		maps.Copy(h, resp.Header)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		maps.Copy(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		return nil // тіло не відправляємо
+		if len(body) > 0 {
+			w.Write(body)
+		}
+		return nil
 	}
 
-	// Успішна авторизація
 	for _, hname := range a.CopyHeaders {
 		if v := resp.Header.Get(hname); v != "" {
 			r.Header.Set(hname, v)
