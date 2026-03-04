@@ -149,7 +149,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	if item := a.cache.Get(key); item != nil {
 		entry := item.Value()
 
-		a.logger.Info("cache hit",
+		a.logger.Debug("cache hit",
 			zap.String("key", key),
 			zap.Int("status", entry.Status),
 		)
@@ -172,14 +172,14 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		maps.Copy(h, entry.Headers)
 		w.WriteHeader(entry.Status)
 
-		a.logger.Info("cache hit → error response",
+		a.logger.Debug("cache hit → error response",
 			zap.Int("status", entry.Status),
 		)
 		return nil
 	}
 
 	// Кеш промах
-	a.logger.Info("cache miss", zap.String("key", key))
+	a.logger.Debug("cache miss", zap.String("key", key))
 
 	u, err := url.Parse(a.AuthURL)
 	if err != nil {
@@ -232,12 +232,12 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		}
 		a.cache.Set(key, entry, ttlcache.DefaultTTL)
 
-		a.logger.Info("cached successful response",
+		a.logger.Debug("cached successful response",
 			zap.String("key", key),
 			zap.Int("status", resp.StatusCode),
 		)
 	} else {
-		a.logger.Info("upstream error - not cached",
+		a.logger.Debug("upstream error - not cached",
 			zap.Int("status", resp.StatusCode),
 			zap.Int("body_size", len(body)),
 		)
@@ -250,7 +250,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		if len(body) > 0 {
 			w.Write(body)
 		}
-		a.logger.Info("returned error from upstream",
+		a.logger.Debug("returned error from upstream",
 			zap.Int("status", resp.StatusCode),
 			zap.Int("body_size", len(body)),
 		)
