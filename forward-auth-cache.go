@@ -56,24 +56,27 @@ func (a *ForwardAuthCache) Validate() error {
 	if a.AuthURL == "" {
 		return fmt.Errorf("forward-auth-cache: 'auth_url' is required")
 	}
-	if a.TTL == 0 {
-		a.TTL = time.Duration(1 * time.Minute)
-	}
 	if a.CookieName == "" {
 		return fmt.Errorf("forward-auth-cache: 'cookie' is required")
 	}
 	if len(a.CopyHeaders) == 0 {
 		return fmt.Errorf("forward-auth-cache: 'copy_headers' is required (at least one)")
 	}
+
+	// Дефолтні значення для опціональних полів
+	if a.TTL == 0 {
+		a.TTL = 1 * time.Minute
+	}
 	if a.CacheKeyTemplate == "" {
 		a.CacheKeyTemplate = "auth:{cookie.__Secure_auth_token}:ip:{remote_host}"
 	}
 	if a.Timeout == 0 {
-		a.Timeout = time.Duration(3 * time.Second)
+		a.Timeout = 3 * time.Second
 	}
 	if a.RequestMethod == "" {
 		a.RequestMethod = http.MethodGet
 	}
+
 	return nil
 }
 
@@ -129,7 +132,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	}
 
 	var key string
-	if a.CacheKeyTemplate == "" || a.CacheKeyTemplate == "auth:{cookie.__Secure_auth_token}:ip:{remote_host}" {
+	if a.CacheKeyTemplate == "auth:{cookie.__Secure_auth_token}:ip:{remote_host}" {
 		key = "auth:" + token + ":ip:" + clientIP
 	} else {
 		key = repl.ReplaceAll(a.CacheKeyTemplate, "")
@@ -164,7 +167,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 			return next.ServeHTTP(w, r)
 		}
 
-		// помилка з кешу
+		// помилка з кешу (без тіла)
 		h := w.Header()
 		maps.Copy(h, entry.Headers)
 		w.WriteHeader(entry.Status)
@@ -341,7 +344,6 @@ func (a *ForwardAuthCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var a ForwardAuthCache
-
 	return &a, a.UnmarshalCaddyfile(h.Dispenser)
 }
 
