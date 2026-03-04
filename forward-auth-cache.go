@@ -164,6 +164,8 @@ func (a *ForwardAuthCache) Cleanup() error {
 	return nil
 }
 
+var cacheAuthHeader = http.CanonicalHeaderKey("X-Cache-Auth")
+
 func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	start := time.Now()
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
@@ -183,6 +185,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		for hname, hval := range entry.Headers {
 			r.Header.Set(hname, hval)
 		}
+		r.Header.Set(cacheAuthHeader, "HIT")
 		return next.ServeHTTP(w, r)
 	}
 
@@ -218,7 +221,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 			Status:  result.Status,
 			Headers: headersToCache,
 		}, ttlcache.DefaultTTL)
-
+		r.Header.Set(cacheAuthHeader, "SET")
 		return next.ServeHTTP(w, r)
 	}
 
