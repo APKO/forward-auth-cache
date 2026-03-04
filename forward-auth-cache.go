@@ -7,7 +7,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
-	"net/url"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -17,6 +17,7 @@ import (
 	"github.com/jellydator/ttlcache/v3"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2"
+	"golang.org/x/sync/singleflight"
 )
 
 func init() {
@@ -34,15 +35,22 @@ type ForwardAuthCache struct {
 	Timeout          time.Duration     `json:"timeout,omitempty"`
 	RequestMethod    string            `json:"method,omitempty"`
 
-	cache        *ttlcache.Cache[string, cacheEntry]
-	client       *http.Client
-	cookiePrefix string
-	logger       *zap.Logger
+	cache  *ttlcache.Cache[string, cacheEntry]
+	client *http.Client
+	logger *zap.Logger
+	sf     *singleflight.Group
 }
 
 type cacheEntry struct {
 	Status  int
 	Headers http.Header
+}
+
+type resultModel struct {
+	Status  int
+	Headers http.Header
+	Body    []byte
+	Success bool
 }
 
 func (ForwardAuthCache) CaddyModule() caddy.ModuleInfo {
@@ -52,65 +60,79 @@ func (ForwardAuthCache) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (a *ForwardAuthCache) Validate() error {
-	if a.AuthURL == "" {
-		return fmt.Errorf("forward-auth-cache: 'auth_url' is required")
-	}
-	if a.CookieName == "" {
-		return fmt.Errorf("forward-auth-cache: 'cookie' is required")
-	}
-	if len(a.CopyHeaders) == 0 {
-		return fmt.Errorf("forward-auth-cache: 'copy_headers' is required (at least one)")
-	}
+// Provision налаштовує модуль перед використанням.
+func (a *ForwardAuthCache) Provision(ctx caddy.Context) error {
+	a.logger = ctx.Logger(a)
+	a.sf = new(singleflight.Group)
 
-	// Дефолтні значення для опціональних полів
-	if a.TTL == 0 {
+	// Дефолтні значення
+	if a.TTL <= 0 {
 		a.TTL = 1 * time.Minute
 	}
-	if a.CacheKeyTemplate == "" {
-		a.CacheKeyTemplate = "auth:{cookie.__Secure_auth_token}:ip:{remote_host}"
-	}
-	if a.Timeout == 0 {
-		a.Timeout = 3 * time.Second
+	if a.Timeout <= 0 {
+		a.Timeout = 5 * time.Second
 	}
 	if a.RequestMethod == "" {
 		a.RequestMethod = http.MethodGet
 	}
+	if a.CookieName == "" {
+		a.CookieName = "__Secure_auth_token"
+	}
+	if a.CacheKeyTemplate == "" {
+		a.CacheKeyTemplate = "auth:{cookie." + a.CookieName + "}:ip:{client_ip}"
+	}
 
-	return nil
-}
-
-func (a *ForwardAuthCache) Provision(ctx caddy.Context) error {
-	a.PassHeaders = make(map[string]string, 10)
-
+	// Ініціалізація кешу
 	a.cache = ttlcache.New(
 		ttlcache.WithTTL[string, cacheEntry](a.TTL),
 		ttlcache.WithCapacity[string, cacheEntry](131072),
 	)
-
 	go a.cache.Start()
 
-	transport := &http2.Transport{
-		AllowHTTP:       true,
-		ReadIdleTimeout: 30 * time.Second,
-		PingTimeout:     15 * time.Second,
-		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-			return net.DialTimeout(network, addr, time.Duration(a.Timeout))
-		},
+	// Налаштування HTTP клієнта
+	if strings.HasPrefix(a.AuthURL, "h2c://") {
+		// Спеціальний транспорт для HTTP/2 Cleartext
+		h2tr := &http2.Transport{
+			AllowHTTP: true,
+			DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+				return net.DialTimeout(network, addr, a.Timeout)
+			},
+		}
+		a.client = &http.Client{Transport: h2tr, Timeout: a.Timeout}
+	} else {
+		// Стандартний транспорт (підтримує HTTP/1.1 та стандартний H2)
+		a.client = &http.Client{
+			Timeout: a.Timeout,
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   a.Timeout,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		}
 	}
-
-	a.client = &http.Client{
-		Transport: transport,
-		Timeout:   time.Duration(a.Timeout),
-	}
-
-	a.cookiePrefix = a.CookieName + "="
-
-	a.logger = ctx.Logger(a)
 
 	return nil
 }
 
+// Validate перевіряє коректність конфігурації.
+func (a *ForwardAuthCache) Validate() error {
+	if a.AuthURL == "" {
+		return fmt.Errorf("forward-auth-cache: 'auth_url' є обов'язковим")
+	}
+	if len(a.CopyHeaders) == 0 {
+		return fmt.Errorf("forward-auth-cache: 'copy_headers' має містити хоча б один заголовок")
+	}
+	return nil
+}
+
+// Cleanup зупиняє фонові процеси.
 func (a *ForwardAuthCache) Cleanup() error {
 	if a.cache != nil {
 		a.cache.Stop()
@@ -121,159 +143,116 @@ func (a *ForwardAuthCache) Cleanup() error {
 func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
-	token := ""
-	if c, _ := r.Cookie(a.CookieName); c != nil {
-		token = c.Value
-	}
+	clientIP := getClientIP(r)
+	repl.Set("client_ip", clientIP)
 
-	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
-	}
+	key := repl.ReplaceAll(a.CacheKeyTemplate, "")
 
-	var key string
-	if a.CacheKeyTemplate == "auth:{cookie.__Secure_auth_token}:ip:{remote_host}" {
-		key = "auth:" + token + ":ip:" + clientIP
-	} else {
-		key = repl.ReplaceAll(a.CacheKeyTemplate, "")
-	}
-
-	a.logger.Debug("forward-auth-cache request",
-		zap.String("path", r.URL.Path),
-		zap.String("method", r.Method),
-		zap.String("cache_key", key),
-		zap.Bool("has_token", token != ""),
-	)
-
-	// Кеш хіт
+	// 1. Перевірка кешу
 	if item := a.cache.Get(key); item != nil {
 		entry := item.Value()
-
-		a.logger.Debug("cache hit",
-			zap.String("key", key),
-			zap.Int("status", entry.Status),
-		)
-
-		if entry.Status == http.StatusOK || entry.Status == http.StatusNoContent {
-			for _, hname := range a.CopyHeaders {
-				if v := entry.Headers.Get(hname); v != "" {
-					r.Header.Set(hname, v)
-					a.logger.Debug("set header from cache",
-						zap.String("header", hname),
-						zap.String("value", v),
-					)
-				}
+		for _, hname := range a.CopyHeaders {
+			if v := entry.Headers.Get(hname); v != "" {
+				r.Header.Set(hname, v)
 			}
-			return next.ServeHTTP(w, r)
+		}
+		return next.ServeHTTP(w, r)
+	}
+
+	// 2. Виконання запиту до сервісу авторизації (із захистом від дублювання)
+	v, err, _ := a.sf.Do(key, func() (any, error) {
+		reqURL := strings.Replace(a.AuthURL, "h2c://", "http://", 1)
+
+		req, err := http.NewRequestWithContext(r.Context(), a.RequestMethod, reqURL, nil)
+		if err != nil {
+			return nil, err
 		}
 
-		// помилка з кешу (без тіла)
-		h := w.Header()
-		maps.Copy(h, entry.Headers)
-		w.WriteHeader(entry.Status)
+		// Копіюємо куки для автентифікації
+		for _, c := range r.Cookies() {
+			req.AddCookie(c)
+		}
 
-		a.logger.Debug("cache hit → error response",
-			zap.Int("status", entry.Status),
-		)
-		return nil
-	}
+		// Передаємо кастомні заголовки (наприклад, X-Original-URI)
+		for name, val := range a.PassHeaders {
+			req.Header.Set(name, repl.ReplaceAll(val, ""))
+		}
 
-	// Кеш промах
-	a.logger.Debug("cache miss", zap.String("key", key))
+		resp, err := a.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
 
-	u, err := url.Parse(a.AuthURL)
-	if err != nil {
-		a.logger.Error("invalid auth_url", zap.Error(err))
-		return caddyhttp.Error(http.StatusInternalServerError, err)
-	}
+		isSuccess := resp.StatusCode >= 200 && resp.StatusCode < 300
 
-	reqURL := a.AuthURL
-	reqHost := u.Host
-	if u.Scheme == "h2c" {
-		reqURL = "http://" + u.Host + u.RequestURI()
-	}
+		// Читаємо тіло лише у разі помилки (макс 16KB для захисту пам'яті)
+		var body []byte
+		if !isSuccess {
+			body, _ = io.ReadAll(io.LimitReader(resp.Body, 16384))
+		}
 
-	req, err := http.NewRequestWithContext(r.Context(), a.RequestMethod, reqURL, nil)
-	if err != nil {
-		a.logger.Error("failed to create auth request", zap.Error(err))
-		return caddyhttp.Error(http.StatusInternalServerError, err)
-	}
-
-	req.Header.Set("Cookie", a.cookiePrefix+token)
-	req.Host = reqHost
-
-	for name, val := range a.PassHeaders {
-		req.Header.Set(name, repl.ReplaceAll(val, ""))
-	}
-
-	a.logger.Debug("sending auth request",
-		zap.String("url", reqURL),
-		zap.String("method", req.Method),
-	)
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		a.logger.Error("auth request failed", zap.Error(err))
-		return caddyhttp.Error(http.StatusBadGateway, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		a.logger.Error("failed to read auth body", zap.Error(err))
-		return caddyhttp.Error(http.StatusBadGateway, err)
-	}
-
-	// Кешуємо ТІЛЬКИ 200 та 204
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
-		entry := cacheEntry{
+		result := resultModel{
 			Status:  resp.StatusCode,
 			Headers: resp.Header.Clone(),
+			Body:    body,
+			Success: isSuccess,
 		}
-		a.cache.Set(key, entry, ttlcache.DefaultTTL)
 
-		a.logger.Debug("cached successful response",
-			zap.String("key", key),
-			zap.Int("status", resp.StatusCode),
-		)
-	} else {
-		a.logger.Debug("upstream error - not cached",
-			zap.Int("status", resp.StatusCode),
-			zap.Int("body_size", len(body)),
-		)
+		if isSuccess {
+			a.cache.Set(key, cacheEntry{
+				Status:  resp.StatusCode,
+				Headers: result.Headers,
+			}, ttlcache.DefaultTTL)
+		}
+
+		return result, nil
+	})
+
+	if err != nil {
+		a.logger.Error("auth request failed", zap.Error(err), zap.String("key", key))
+		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
 
-	// Якщо НЕ 200 і НЕ 204 — повертаємо повну відповідь клієнту
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		maps.Copy(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		if len(body) > 0 {
-			w.Write(body)
-		}
-		a.logger.Debug("returned error from upstream",
-			zap.Int("status", resp.StatusCode),
-			zap.Int("body_size", len(body)),
-		)
+	result := v.(resultModel)
+
+	if !result.Success {
+		// Повертаємо помилку авторизації клієнту
+		maps.Copy(w.Header(), result.Headers)
+		w.WriteHeader(result.Status)
+		w.Write(result.Body)
 		return nil
 	}
 
-	// Успішна авторизація
+	// Успіх: додаємо заголовки в оригінальний запит
 	for _, hname := range a.CopyHeaders {
-		if v := resp.Header.Get(hname); v != "" {
+		if v := result.Headers.Get(hname); v != "" {
 			r.Header.Set(hname, v)
-			a.logger.Debug("set header to downstream request",
-				zap.String("header", hname),
-				zap.String("value", v),
-			)
 		}
 	}
 
 	return next.ServeHTTP(w, r)
 }
 
-func (a *ForwardAuthCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	a.PassHeaders = make(map[string]string, 8)
+func getClientIP(r *http.Request) string {
+	for _, h := range []string{"True-Client-IP", "X-Real-IP"} {
+		if ip := r.Header.Get(h); ip != "" {
+			return strings.TrimSpace(ip)
+		}
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if host == "" {
+		return r.RemoteAddr
+	}
+	return host
+}
 
+func (a *ForwardAuthCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	a.PassHeaders = make(map[string]string)
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
@@ -281,64 +260,51 @@ func (a *ForwardAuthCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.Args(&a.AuthURL) {
 					return d.ArgErr()
 				}
-
 			case "ttl":
-				if !d.Args() {
+				var durStr string
+				if !d.Args(&durStr) {
 					return d.ArgErr()
 				}
-				dur, err := caddy.ParseDuration(d.Val())
+				dur, err := caddy.ParseDuration(durStr)
 				if err != nil {
-					return err
+					return d.Errf("invalid ttl: %v", err)
 				}
-				a.TTL = time.Duration(dur)
-
+				a.TTL = dur
 			case "cookie":
 				if !d.Args(&a.CookieName) {
 					return d.ArgErr()
 				}
-
 			case "copy_headers":
 				a.CopyHeaders = d.RemainingArgs()
-				if len(a.CopyHeaders) == 0 {
-					return d.Err("copy_headers requires at least one header name")
-				}
-
 			case "pass_header":
-				var name, value string
-				if !d.Args(&name) {
+				var k, v string
+				if !d.Args(&k, &v) {
 					return d.ArgErr()
 				}
-				if !d.Args(&value) {
-					return d.ArgErr()
-				}
-				a.PassHeaders[name] = value
-
+				a.PassHeaders[k] = v
 			case "cache_key":
 				if !d.Args(&a.CacheKeyTemplate) {
 					return d.ArgErr()
 				}
-
 			case "timeout":
-				if !d.Args() {
+				var durStr string
+				if !d.Args(&durStr) {
 					return d.ArgErr()
 				}
-				dur, err := caddy.ParseDuration(d.Val())
+				dur, err := caddy.ParseDuration(durStr)
 				if err != nil {
-					return err
+					return d.Errf("invalid timeout: %v", err)
 				}
-				a.Timeout = time.Duration(dur)
-
+				a.Timeout = dur
 			case "method":
 				if !d.Args(&a.RequestMethod) {
 					return d.ArgErr()
 				}
-
 			default:
-				return d.Errf("unrecognized directive: %s", d.Val())
+				return d.Errf("unknown directive: %s", d.Val())
 			}
 		}
 	}
-
 	return nil
 }
 
@@ -347,6 +313,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	return &a, a.UnmarshalCaddyfile(h.Dispenser)
 }
 
+// Перевірка інтерфейсів
 var (
 	_ caddy.Provisioner           = (*ForwardAuthCache)(nil)
 	_ caddy.Validator             = (*ForwardAuthCache)(nil)
