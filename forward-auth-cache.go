@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/jellydator/ttlcache/v3"
+	"go.uber.org/zap"
 	"golang.org/x/net/http2"
 )
 
@@ -34,7 +36,8 @@ type ForwardAuthCache struct {
 
 	cache        *ttlcache.Cache[string, cacheEntry]
 	client       *http.Client
-	cookiePrefix string // оптимізація — префікс "CookieName="
+	cookiePrefix string
+	logger       *zap.Logger
 }
 
 type cacheEntry struct {
@@ -79,7 +82,7 @@ func (a *ForwardAuthCache) Provision(ctx caddy.Context) error {
 
 	a.cache = ttlcache.New(
 		ttlcache.WithTTL[string, cacheEntry](a.TTL),
-		ttlcache.WithCapacity[string, cacheEntry](131072), // ~128k слотів
+		ttlcache.WithCapacity[string, cacheEntry](131072),
 	)
 
 	go a.cache.Start()
@@ -100,6 +103,8 @@ func (a *ForwardAuthCache) Provision(ctx caddy.Context) error {
 
 	a.cookiePrefix = a.CookieName + "="
 
+	a.logger = ctx.Logger(a)
+
 	return nil
 }
 
@@ -117,37 +122,68 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	if c, _ := r.Cookie(a.CookieName); c != nil {
 		token = c.Value
 	}
+
 	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 	if clientIP == "" {
 		clientIP = r.RemoteAddr
 	}
+
 	var key string
-	if a.CacheKeyTemplate == "auth:{cookie.__Secure_auth_token}:ip:{remote_host}" {
+	if a.CacheKeyTemplate == "" || a.CacheKeyTemplate == "auth:{cookie.__Secure_auth_token}:ip:{remote_host}" {
 		key = "auth:" + token + ":ip:" + clientIP
 	} else {
 		key = repl.ReplaceAll(a.CacheKeyTemplate, "")
 	}
 
+	a.logger.Debug("forward-auth-cache request",
+		zap.String("path", r.URL.Path),
+		zap.String("method", r.Method),
+		zap.String("cache_key", key),
+		zap.Bool("has_token", token != ""),
+	)
+
+	// Кеш хіт
 	if item := a.cache.Get(key); item != nil {
 		entry := item.Value()
 
-		if entry.Status != http.StatusOK && entry.Status != http.StatusNoContent {
-			h := w.Header()
-			maps.Copy(h, entry.Headers)
-			w.WriteHeader(entry.Status)
-			// Тут тіла немає, бо ми його не кешуємо
-			return nil
+		a.logger.Info("cache hit",
+			zap.String("key", key),
+			zap.Int("status", entry.Status),
+		)
+
+		if entry.Status == http.StatusOK || entry.Status == http.StatusNoContent {
+			for _, hname := range a.CopyHeaders {
+				if v := entry.Headers.Get(hname); v != "" {
+					r.Header.Set(hname, v)
+					a.logger.Debug("set header from cache",
+						zap.String("header", hname),
+						zap.String("value", v),
+					)
+				}
+			}
+			return next.ServeHTTP(w, r)
 		}
 
-		for _, hname := range a.CopyHeaders {
-			if v := entry.Headers.Get(hname); v != "" {
-				r.Header.Set(hname, v)
-			}
-		}
-		return next.ServeHTTP(w, r)
+		// помилка з кешу
+		h := w.Header()
+		maps.Copy(h, entry.Headers)
+		w.WriteHeader(entry.Status)
+
+		a.logger.Info("cache hit → error response",
+			zap.Int("status", entry.Status),
+		)
+		return nil
 	}
 
-	u, _ := url.Parse(a.AuthURL)
+	// Кеш промах
+	a.logger.Info("cache miss", zap.String("key", key))
+
+	u, err := url.Parse(a.AuthURL)
+	if err != nil {
+		a.logger.Error("invalid auth_url", zap.Error(err))
+		return caddyhttp.Error(http.StatusInternalServerError, err)
+	}
+
 	reqURL := a.AuthURL
 	reqHost := u.Host
 	if u.Scheme == "h2c" {
@@ -156,6 +192,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 
 	req, err := http.NewRequestWithContext(r.Context(), a.RequestMethod, reqURL, nil)
 	if err != nil {
+		a.logger.Error("failed to create auth request", zap.Error(err))
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 
@@ -166,84 +203,152 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		req.Header.Set(name, repl.ReplaceAll(val, ""))
 	}
 
+	a.logger.Debug("sending auth request",
+		zap.String("url", reqURL),
+		zap.String("method", req.Method),
+	)
+
 	resp, err := a.client.Do(req)
 	if err != nil {
+		a.logger.Error("auth request failed", zap.Error(err))
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		a.logger.Error("failed to read auth body", zap.Error(err))
 		return caddyhttp.Error(http.StatusBadGateway, err)
 	}
 
-	entry := cacheEntry{
-		Status:  resp.StatusCode,
-		Headers: resp.Header.Clone(),
-	}
-
+	// Кешуємо ТІЛЬКИ 200 та 204
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+		entry := cacheEntry{
+			Status:  resp.StatusCode,
+			Headers: resp.Header.Clone(),
+		}
 		a.cache.Set(key, entry, ttlcache.DefaultTTL)
+
+		a.logger.Info("cached successful response",
+			zap.String("key", key),
+			zap.Int("status", resp.StatusCode),
+		)
+	} else {
+		a.logger.Info("upstream error - not cached",
+			zap.Int("status", resp.StatusCode),
+			zap.Int("body_size", len(body)),
+		)
 	}
 
+	// Якщо НЕ 200 і НЕ 204 — повертаємо повну відповідь клієнту
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		maps.Copy(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		if len(body) > 0 {
 			w.Write(body)
 		}
+		a.logger.Info("returned error from upstream",
+			zap.Int("status", resp.StatusCode),
+			zap.Int("body_size", len(body)),
+		)
 		return nil
 	}
 
+	// Успішна авторизація
 	for _, hname := range a.CopyHeaders {
 		if v := resp.Header.Get(hname); v != "" {
 			r.Header.Set(hname, v)
+			a.logger.Debug("set header to downstream request",
+				zap.String("header", hname),
+				zap.String("value", v),
+			)
 		}
 	}
 
 	return next.ServeHTTP(w, r)
 }
 
-func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	a := new(ForwardAuthCache)
+func (a *ForwardAuthCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	a.PassHeaders = make(map[string]string, 8)
 
-	for h.Next() {
-		for h.NextBlock(0) {
-			switch h.Val() {
+	for d.Next() {
+		for d.NextBlock(0) {
+			switch d.Val() {
 			case "auth_url":
-				a.AuthURL = h.RemainingArgs()[0]
+				if !d.Args(&a.AuthURL) {
+					return d.ArgErr()
+				}
+
 			case "ttl":
-				d, err := caddy.ParseDuration(h.RemainingArgs()[0])
-				if err != nil {
-					return nil, err
+				if !d.Args() {
+					return d.ArgErr()
 				}
-				a.TTL = time.Duration(d)
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return err
+				}
+				a.TTL = time.Duration(dur)
+
 			case "cookie":
-				a.CookieName = h.RemainingArgs()[0]
+				if !d.Args(&a.CookieName) {
+					return d.ArgErr()
+				}
+
 			case "copy_headers":
-				for h.NextArg() {
-					a.CopyHeaders = append(a.CopyHeaders, h.Val())
+				a.CopyHeaders = d.RemainingArgs()
+				if len(a.CopyHeaders) == 0 {
+					return d.Err("copy_headers requires at least one header name")
 				}
+
 			case "pass_header":
-				if h.NextArg() {
-					name := h.Val()
-					if h.NextArg() {
-						a.PassHeaders[name] = h.Val()
-					}
+				var name, value string
+				if !d.Args(&name) {
+					return d.ArgErr()
 				}
+				if !d.Args(&value) {
+					return d.ArgErr()
+				}
+				a.PassHeaders[name] = value
+
 			case "cache_key":
-				a.CacheKeyTemplate = h.RemainingArgs()[0]
-			case "timeout":
-				d, err := caddy.ParseDuration(h.RemainingArgs()[0])
-				if err != nil {
-					return nil, err
+				if !d.Args(&a.CacheKeyTemplate) {
+					return d.ArgErr()
 				}
-				a.Timeout = time.Duration(d)
+
+			case "timeout":
+				if !d.Args() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return err
+				}
+				a.Timeout = time.Duration(dur)
+
 			case "method":
-				a.RequestMethod = h.RemainingArgs()[0]
+				if !d.Args(&a.RequestMethod) {
+					return d.ArgErr()
+				}
+
+			default:
+				return d.Errf("unrecognized directive: %s", d.Val())
 			}
 		}
 	}
-	return a, nil
+
+	return nil
 }
+
+func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	var a ForwardAuthCache
+
+	return &a, a.UnmarshalCaddyfile(h.Dispenser)
+}
+
+var (
+	_ caddy.Provisioner           = (*ForwardAuthCache)(nil)
+	_ caddy.Validator             = (*ForwardAuthCache)(nil)
+	_ caddy.CleanerUpper          = (*ForwardAuthCache)(nil)
+	_ caddyhttp.MiddlewareHandler = (*ForwardAuthCache)(nil)
+	_ caddyfile.Unmarshaler       = (*ForwardAuthCache)(nil)
+)
