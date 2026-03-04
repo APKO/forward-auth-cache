@@ -139,6 +139,7 @@ func (a *ForwardAuthCache) Provision(ctx caddy.Context) error {
 			},
 		}
 	}
+	a.logger.Info("Created Auth Service Success", zap.String("url", a.AuthURL))
 	return nil
 }
 
@@ -156,6 +157,7 @@ func (a *ForwardAuthCache) Cleanup() error {
 	if a.cache != nil {
 		a.cache.Stop()
 	}
+	a.logger.Info("Auth handler cleaned up")
 	return nil
 }
 
