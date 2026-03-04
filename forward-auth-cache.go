@@ -117,13 +117,15 @@ func (a *ForwardAuthCache) Provision(ctx caddy.Context) error {
 	go a.cache.Start()
 
 	if strings.HasPrefix(a.AuthURL, "h2c://") {
-		h2tr := &http2.Transport{
-			AllowHTTP: true,
-			DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-				return net.DialTimeout(network, addr, a.Timeout)
+		a.client = &http.Client{
+			Transport: &http2.Transport{
+				AllowHTTP: true,
+				DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+					return net.DialTimeout(network, addr, a.Timeout)
+				},
 			},
+			Timeout: a.Timeout,
 		}
-		a.client = &http.Client{Transport: h2tr, Timeout: a.Timeout}
 	} else {
 		a.client = &http.Client{
 			Timeout: a.Timeout,
@@ -157,7 +159,6 @@ func (a *ForwardAuthCache) Cleanup() error {
 	if a.cache != nil {
 		a.cache.Stop()
 	}
-	a.logger.Info("Auth handler cleaned up")
 	return nil
 }
 
@@ -173,7 +174,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		a.logger.Info("auth check started", zap.String("key", key), zap.String("path", r.URL.Path))
 	}
 
-	// 1. Перевірка кешу
+	// 1. Кеш
 	if item := a.cache.Get(key); item != nil {
 		entry := item.Value()
 		if a.Debug {
@@ -187,11 +188,7 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		return next.ServeHTTP(w, r)
 	}
 
-	if a.Debug {
-		a.logger.Info("cache miss, calling auth service", zap.String("key", key))
-	}
-
-	// 2. Виконання прямого запиту до сервісу авторизації
+	// 2. Auth запит
 	result, err := a.doAuthRequest(r, repl)
 	if err != nil {
 		a.logger.Error("auth request failed", zap.Error(err), zap.String("key", key))
@@ -202,30 +199,34 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		a.logger.Info("auth service responded", zap.Object("result", result), zap.Duration("latency", time.Since(start)))
 	}
 
-	// 3. Кешування при успіху
+	// 3. Обробка
 	if result.Success {
 		a.cache.Set(key, cacheEntry{Status: result.Status, Headers: result.Headers}, ttlcache.DefaultTTL)
-	} else {
-		if a.Debug {
-			a.logger.Warn("access denied by auth service", zap.String("key", key), zap.Object("result", result))
+		for _, hname := range a.CopyHeaders {
+			if v := result.Headers.Get(hname); v != "" {
+				r.Header.Set(hname, v)
+			}
 		}
-		maps.Copy(w.Header(), result.Headers)
+		return next.ServeHTTP(w, r)
+	}
+
+	// Відмова: використовуємо caddyhttp.Error для інтеграції з handle_errors
+	if a.Debug {
+		a.logger.Warn("access denied by auth service", zap.String("key", key), zap.Object("result", result))
+	}
+
+	// Копіюємо заголовки (наприклад, WWW-Authenticate або кастомні для помилки)
+	maps.Copy(w.Header(), result.Headers)
+
+	if len(result.Body) > 0 {
 		w.WriteHeader(result.Status)
 		w.Write(result.Body)
 		return nil
 	}
 
-	// Додавання заголовків в оригінальний запит
-	for _, hname := range a.CopyHeaders {
-		if v := result.Headers.Get(hname); v != "" {
-			r.Header.Set(hname, v)
-		}
-	}
-
-	return next.ServeHTTP(w, r)
+	return caddyhttp.Error(result.Status, fmt.Errorf("access denied"))
 }
 
-// doAuthRequest виконує фактичний HTTP запит до сервера авторизації
 func (a *ForwardAuthCache) doAuthRequest(r *http.Request, repl *caddy.Replacer) (resultModel, error) {
 	reqURL := strings.Replace(a.AuthURL, "h2c://", "http://", 1)
 	req, err := http.NewRequestWithContext(r.Context(), a.RequestMethod, reqURL, nil)
@@ -236,6 +237,14 @@ func (a *ForwardAuthCache) doAuthRequest(r *http.Request, repl *caddy.Replacer) 
 	for _, c := range r.Cookies() {
 		req.AddCookie(c)
 	}
+
+	// Прокидаємо вхідні заголовки в Auth-сервіс
+	for _, hname := range a.CopyHeaders {
+		if val := r.Header.Get(hname); val != "" {
+			req.Header.Set(hname, val)
+		}
+	}
+
 	for name, val := range a.PassHeaders {
 		req.Header.Set(name, repl.ReplaceAll(val, ""))
 	}
@@ -246,10 +255,12 @@ func (a *ForwardAuthCache) doAuthRequest(r *http.Request, repl *caddy.Replacer) 
 	}
 	defer resp.Body.Close()
 
-	isSuccess := resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent
+	isSuccess := resp.StatusCode >= 200 && resp.StatusCode < 300
 	var body []byte
 	if !isSuccess {
 		body, _ = io.ReadAll(io.LimitReader(resp.Body, 16384))
+	} else {
+		io.Copy(io.Discard, resp.Body) // Вичитуємо успішне тіло для Keep-Alive
 	}
 
 	return resultModel{
@@ -270,9 +281,6 @@ func getClientIP(r *http.Request) string {
 		return strings.TrimSpace(strings.Split(xff, ",")[0])
 	}
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if host == "" {
-		return r.RemoteAddr
-	}
 	return host
 }
 
