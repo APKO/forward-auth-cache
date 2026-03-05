@@ -37,9 +37,10 @@ type ForwardAuthCache struct {
 	Timeout          time.Duration     `json:"timeout,omitempty"`
 	RequestMethod    string            `json:"method,omitempty"`
 	Debug            bool              `json:"debug,omitempty"`
+	UserIDHeader     string            `json:"user_id_header,omitempty"`
 
 	cache  *ttlcache.Cache[string, cacheEntry]
-	group  *singleflight.Group // Потокобезпечна дедуплікація (через вказівник)
+	group  *singleflight.Group
 	client *http.Client
 	logger *zap.Logger
 }
@@ -47,10 +48,12 @@ type ForwardAuthCache struct {
 type cacheEntry struct {
 	Status  int
 	Headers map[string]string
+	UserID  string
 }
 
 func (u cacheEntry) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	enc.AddInt("status", u.Status)
+	enc.AddString("user_id", u.UserID)
 	if len(u.Headers) > 0 {
 		_ = enc.AddObject("headers", zapcore.ObjectMarshalerFunc(func(hEnc zapcore.ObjectEncoder) error {
 			for key, val := range u.Headers {
@@ -67,11 +70,13 @@ type resultModel struct {
 	Headers http.Header
 	Body    []byte
 	Success bool
+	UserID  string
 }
 
 func (u resultModel) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	enc.AddInt("status", u.Status)
 	enc.AddBool("success", u.Success)
+	enc.AddString("user_id", u.UserID)
 	if u.Headers != nil {
 		_ = enc.AddObject("headers", zapcore.ObjectMarshalerFunc(func(hEnc zapcore.ObjectEncoder) error {
 			for key, values := range u.Headers {
@@ -185,6 +190,9 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		for hname, hval := range entry.Headers {
 			r.Header.Set(hname, hval)
 		}
+		if a.UserIDHeader != "" {
+			repl.Set("http.auth.user.id", entry.UserID)
+		}
 		r.Header.Set(cacheAuthHeader, "HIT")
 		return next.ServeHTTP(w, r)
 	}
@@ -217,9 +225,14 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 			}
 		}
 
+		if a.UserIDHeader != "" {
+			repl.Set("http.auth.user.id", result.UserID)
+		}
+
 		a.cache.Set(key, cacheEntry{
 			Status:  result.Status,
 			Headers: headersToCache,
+			UserID:  result.UserID,
 		}, ttlcache.DefaultTTL)
 		r.Header.Set(cacheAuthHeader, "SET")
 		return next.ServeHTTP(w, r)
@@ -274,10 +287,17 @@ func (a *ForwardAuthCache) doAuthRequest(r *http.Request, repl *caddy.Replacer) 
 
 	isSuccess := resp.StatusCode >= 200 && resp.StatusCode < 300
 	var body []byte
-	if !isSuccess {
-		body, _ = io.ReadAll(io.LimitReader(resp.Body, 16384))
-	} else {
+	var userID string
+	if isSuccess {
+		if a.UserIDHeader != "" {
+			userID = resp.Header.Get(a.UserIDHeader)
+			if userID == "" {
+				a.logger.Warn("user_id header is empty", zap.String("header", a.UserIDHeader))
+			}
+		}
 		_, _ = io.Copy(io.Discard, resp.Body)
+	} else {
+		body, _ = io.ReadAll(io.LimitReader(resp.Body, 16384))
 	}
 
 	return resultModel{
@@ -285,6 +305,7 @@ func (a *ForwardAuthCache) doAuthRequest(r *http.Request, repl *caddy.Replacer) 
 		Headers: resp.Header.Clone(), // Clone гарантує безпеку даних
 		Body:    body,
 		Success: isSuccess,
+		UserID:  userID,
 	}, nil
 }
 
@@ -352,6 +373,10 @@ func (a *ForwardAuthCache) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 			case "debug":
 				a.Debug = true
+			case "user_id_header":
+				if !d.Args(&a.UserIDHeader) {
+					return d.ArgErr()
+				}
 			default:
 				return d.Errf("unknown directive: %s", d.Val())
 			}
