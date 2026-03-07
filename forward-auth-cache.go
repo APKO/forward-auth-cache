@@ -169,7 +169,10 @@ func (a *ForwardAuthCache) Cleanup() error {
 	return nil
 }
 
-var cacheAuthHeader = http.CanonicalHeaderKey("X-Cache-Auth")
+var (
+	cacheAuthHeader = http.CanonicalHeaderKey("X-Cache-Auth")
+	realIPHeader    = http.CanonicalHeaderKey("X-Real-IP")
+)
 
 func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	start := time.Now()
@@ -255,7 +258,6 @@ func (a *ForwardAuthCache) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 func (a *ForwardAuthCache) doAuthRequest(r *http.Request, repl *caddy.Replacer) (resultModel, error) {
 	reqURL := strings.Replace(a.AuthURL, "h2c://", "http://", 1)
 
-	// Використання context.Background() захищає від відміни запиту клієнтом
 	ctx, cancel := context.WithTimeout(context.Background(), a.Timeout)
 	defer cancel()
 
@@ -274,10 +276,12 @@ func (a *ForwardAuthCache) doAuthRequest(r *http.Request, repl *caddy.Replacer) 
 		}
 	}
 
-	// Читання з a.PassHeaders — безпечне, бо мапа не змінюється після Provision
 	for name, val := range a.PassHeaders {
-		req.Header.Set(name, repl.ReplaceAll(val, ""))
+		if headerVal := repl.ReplaceAll(val, ""); headerVal != "" {
+			req.Header.Set(name, headerVal)
+		}
 	}
+	req.Header.Set(realIPHeader, getClientIP(r))
 
 	resp, err := a.client.Do(req)
 	if err != nil {
@@ -310,7 +314,7 @@ func (a *ForwardAuthCache) doAuthRequest(r *http.Request, repl *caddy.Replacer) 
 }
 
 func getClientIP(r *http.Request) string {
-	for _, h := range []string{"True-Client-IP", "X-Real-IP"} {
+	for _, h := range []string{"True-Client-IP", realIPHeader} {
 		if ip := r.Header.Get(h); ip != "" {
 			return strings.TrimSpace(ip)
 		}
